@@ -1,0 +1,15 @@
+{
+  "name": "Bhog Coupons and Collection",
+  "short_name": "BhogPWA",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f8fb",
+  "theme_color": "#1f5eff",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

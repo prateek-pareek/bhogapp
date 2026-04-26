@@ -1,0 +1,19 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+  color: #151515;
+  background: #f7f8fb;
+}
+
+h1,
+h2 {
+  margin: 0;
+}
+
+#root {
+  min-height: 100vh;
+}
