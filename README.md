@@ -29,6 +29,15 @@ Optional frontend env override:
 echo "VITE_API_BASE_URL=http://localhost:4000" > .env.local
 ```
 
+WhatsApp Cloud API envs (backend `.env`):
+
+```bash
+WHATSAPP_ACCESS_TOKEN=your_meta_access_token
+WHATSAPP_PHONE_NUMBER_ID=your_phone_number_id
+WHATSAPP_API_VERSION=v20.0
+WHATSAPP_DEFAULT_COUNTRY_CODE=91
+```
+
 ## Default login users
 
 - `admin` / `admin123`
@@ -61,7 +70,12 @@ npm run build
   - Express + MongoDB (Mongoose)
   - JWT authentication
   - Seeded role users
-  - Persistent shared state API (`GET/PUT /api/state`)
+  - Persistent shared state API (`GET/PUT /api/state`) for compatibility
+  - Modular APIs (`/api/events`, `/api/audit-logs`)
+  - Immutable server-side audit log append endpoint (`POST /api/audit-logs`)
+  - Dedicated registration APIs for create/approve/reject/bulk upload
+  - Dedicated coupon scan API and payment create API
+  - WhatsApp Cloud API integration via backend (server-side sends)
 
 ## Notes
 

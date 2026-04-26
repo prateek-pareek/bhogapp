@@ -1,21 +1,26 @@
-import { useMemo, useState, type ChangeEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import dayjs from 'dayjs'
-import { v4 as uuid } from 'uuid'
 import * as XLSX from 'xlsx'
 import './App.css'
-import { fetchState, loginRequest, saveStateRemote } from './lib/api'
-import { buildQrToken, downloadTextFile } from './lib/qr'
+import {
+  approveRegistrationRequest,
+  bulkCreateRegistrationsRequest,
+  createEventRequest,
+  createPaymentRequest,
+  createRegistrationRequest,
+  fetchState,
+  loginRequest,
+  scanCouponRequest,
+  rejectRegistrationRequest,
+} from './lib/api'
+import { downloadTextFile } from './lib/qr'
 import { loadState, saveState, toCsv, type AppState } from './lib/storage'
 import type {
-  AuditLog,
   Coupon,
-  Event,
   MemberType,
-  Payment,
   PaymentMode,
   PaymentPurpose,
   PaymentStatus,
-  Registration,
   UserRole,
   UserSession,
 } from './types'
@@ -37,6 +42,8 @@ function App() {
   const [activeTab, setActiveTab] = useState<Tab>('scan')
   const [loginForm, setLoginForm] = useState({ role: 'admin' as UserRole, username: '', password: '' })
   const [scanToken, setScanToken] = useState('')
+  const [cameraActive, setCameraActive] = useState(false)
+  const [cameraError, setCameraError] = useState('')
   const [selectedEventId, setSelectedEventId] = useState(state.events[0]?.id ?? '')
   const [newEvent, setNewEvent] = useState({ name: '', date: dayjs().format('YYYY-MM-DD') })
   const [reportDate, setReportDate] = useState('')
@@ -72,6 +79,10 @@ function App() {
     trustAccount: 'Trust',
     collectorName: '',
   })
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const rafRef = useRef<number | null>(null)
+  const cameraActiveRef = useRef(false)
 
   const couponsByEvent = useMemo(() => {
     const map = new Map<string, Coupon[]>()
@@ -96,36 +107,6 @@ function App() {
   )
 
   const scannedCount = eventCoupons.filter((coupon) => coupon.consumedAt).length
-
-  const updateState = async (next: AppState) => {
-    setState(next)
-    saveState(next)
-    if (authToken) {
-      try {
-        await saveStateRemote(authToken, next)
-      } catch {
-        alert('Failed to sync to server. Check backend connection.')
-      }
-    }
-  }
-
-  const pushStateAndLog = async (nextState: AppState, action: string, details: string, eventId?: string) => {
-    const log: AuditLog = {
-      id: uuid(),
-      action,
-      details,
-      actor: session?.username ?? 'system',
-      role: session?.role ?? 'admin',
-      eventId,
-      createdAt: new Date().toISOString(),
-    }
-    await updateState({ ...nextState, auditLogs: [log, ...nextState.auditLogs] })
-  }
-
-  const openWhatsApp = (phone: string, message: string) => {
-    const url = `https://wa.me/${phone.replace(/\D/g, '')}?text=${encodeURIComponent(message)}`
-    window.open(url, '_blank', 'noopener,noreferrer')
-  }
 
   const login = async () => {
     if (!loginForm.username.trim()) {
@@ -152,37 +133,80 @@ function App() {
     }
   }
 
-  const createEvent = () => {
+  const refreshFromServer = async (token: string) => {
+    const remoteState = await fetchState(token)
+    setState(remoteState)
+    saveState(remoteState)
+    if (!selectedEventId && remoteState.events[0]?.id) {
+      setSelectedEventId(remoteState.events[0].id)
+    }
+  }
+
+  const createEvent = async () => {
+    if (!authToken) return
     if (!newEvent.name.trim() || !newEvent.date) return
-    const event: Event = { id: uuid(), name: newEvent.name.trim(), date: newEvent.date }
-    const nextState = { ...state, events: [event, ...state.events] }
-    setSelectedEventId(event.id)
-    setIssueForm({ ...issueForm, eventId: event.id })
-    setPreRegForm({ ...preRegForm, eventId: event.id })
-    pushStateAndLog(nextState, 'event.create', `Created event ${event.name} (${event.date})`, event.id)
+    await createEventRequest(authToken, { name: newEvent.name.trim(), date: newEvent.date })
+    await refreshFromServer(authToken)
     setNewEvent({ name: '', date: dayjs().format('YYYY-MM-DD') })
   }
 
-  const generateCouponsForRegistration = (registration: Registration, now: string) =>
-    Array.from({ length: registration.quantity }).map(() => ({
-      id: uuid(),
-      eventId: registration.eventId,
-      registrationId: registration.id,
-      qrToken: buildQrToken(registration.eventId),
-      createdAt: now,
-    }))
-
-  const sendRegistrationQrsWhatsApp = (registration: Registration, coupons: Coupon[]) => {
-    const event = state.events.find((item) => item.id === registration.eventId)
-    const lines = coupons.map((coupon, index) => `${index + 1}. ${coupon.qrToken}`)
-    const message = [
-      `Jai Shree Krishna ${registration.name},`,
-      `Your Bhog entry QR(s) for ${event?.name ?? 'event'} (${event?.date ?? ''}):`,
-      ...lines,
-      'Each QR is valid for one person and can be scanned once.',
-    ].join('\n')
-    openWhatsApp(registration.whatsapp, message)
+  const stopCameraScanner = () => {
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+    }
+    if (streamRef.current) {
+      for (const track of streamRef.current.getTracks()) track.stop()
+      streamRef.current = null
+    }
+    cameraActiveRef.current = false
+    setCameraActive(false)
   }
+
+  const startCameraScanner = async () => {
+    try {
+      setCameraError('')
+      const BarcodeDetectorClass = (window as unknown as { BarcodeDetector?: { new (options?: { formats?: string[] }): { detect: (source: ImageBitmapSource) => Promise<Array<{ rawValue?: string }>> } } }).BarcodeDetector
+      if (!BarcodeDetectorClass) {
+        setCameraError('BarcodeDetector is not supported in this browser.')
+        return
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } },
+      })
+      streamRef.current = stream
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        await videoRef.current.play()
+      }
+      cameraActiveRef.current = true
+      setCameraActive(true)
+      const detector = new BarcodeDetectorClass({ formats: ['qr_code'] })
+      const tick = async () => {
+        if (!videoRef.current || !cameraActiveRef.current) return
+        try {
+          const codes = await detector.detect(videoRef.current)
+          const value = codes[0]?.rawValue?.trim()
+          if (value) {
+            setScanToken(value)
+            stopCameraScanner()
+            return
+          }
+        } catch {
+          // Ignore transient frame parsing failures.
+        }
+        rafRef.current = requestAnimationFrame(() => {
+          void tick()
+        })
+      }
+      void tick()
+    } catch {
+      setCameraError('Unable to access camera. Check browser permissions.')
+      stopCameraScanner()
+    }
+  }
+
+  useEffect(() => () => stopCameraScanner(), [])
 
   if (!session) {
     return (
@@ -208,146 +232,79 @@ function App() {
 
   const tabs = roleTabs[session.role]
 
-  const issueOnSpot = () => {
-    if (!issueForm.name || !issueForm.whatsapp || !selectedEvent?.id || issueForm.quantity < 1) return alert('Fill required fields.')
-    const now = new Date().toISOString()
-    const registrationId = uuid()
-    const registration: Registration = {
-      id: registrationId,
+  const issueOnSpot = async () => {
+    if (!authToken || !issueForm.name || !issueForm.whatsapp || !selectedEvent?.id || issueForm.quantity < 1) {
+      return alert('Fill required fields.')
+    }
+    await createRegistrationRequest(authToken, {
       eventId: selectedEvent.id,
       name: issueForm.name,
       whatsapp: issueForm.whatsapp,
       quantity: issueForm.quantity,
       memberType: issueForm.memberType,
-      source: 'on-spot' as const,
-      paymentStatus: 'paid' as const,
-      status: 'confirmed' as const,
-      createdAt: now,
-      updatedAt: now,
-    }
-    const coupons = generateCouponsForRegistration(registration, now)
-    const nextState = {
-      ...state,
-      registrations: [registration, ...state.registrations],
-      coupons: [...coupons, ...state.coupons],
-    }
-    pushStateAndLog(nextState, 'bhog.issue.manual', `Issued ${coupons.length} QR(s) for ${registration.name}`, registration.eventId)
-    sendRegistrationQrsWhatsApp(registration, coupons)
+      source: 'on-spot',
+      paymentStatus: 'paid',
+    })
+    await refreshFromServer(authToken)
+    alert('QRs issued and WhatsApp dispatched via Cloud API (if configured).')
   }
 
-  const scanCoupon = () => {
-    const coupon = state.coupons.find((item) => item.qrToken === scanToken.trim())
-    if (!coupon) return alert('Invalid QR token.')
-    if (coupon.consumedAt) return alert('QR already scanned.')
-    if (selectedEvent && coupon.eventId !== selectedEvent.id) return alert('QR belongs to another event.')
-    const nextCoupons = state.coupons.map((item) =>
-      item.id === coupon.id
-        ? {
-            ...item,
-            consumedAt: new Date().toISOString(),
-            scannerUser: session.username,
-            scannerRole: session.role,
-            scannerDevice: navigator.userAgent,
-          }
-        : item,
-    )
-    pushStateAndLog({ ...state, coupons: nextCoupons }, 'bhog.scan', `Scanned token ${coupon.qrToken}`, coupon.eventId)
-    setScanToken('')
+  const scanCoupon = async () => {
+    if (!authToken || !selectedEvent?.id || !scanToken.trim()) return
+    try {
+      await scanCouponRequest(authToken, {
+        qrToken: scanToken.trim(),
+        eventId: selectedEvent.id,
+        scannerDevice: navigator.userAgent,
+      })
+      await refreshFromServer(authToken)
+      setScanToken('')
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Failed to scan')
+    }
   }
 
-  const addPreReg = () => {
-    if (!preRegForm.name || !preRegForm.whatsapp || !selectedEvent?.id) return
-    const now = new Date().toISOString()
-    const id = uuid()
-    const paid = preRegForm.paymentStatus === 'paid'
-    const registration: Registration = {
-      id,
+  const addPreReg = async () => {
+    if (!authToken || !preRegForm.name || !preRegForm.whatsapp || !selectedEvent?.id) return
+    await createRegistrationRequest(authToken, {
       eventId: selectedEvent.id,
       name: preRegForm.name,
       whatsapp: preRegForm.whatsapp,
       quantity: preRegForm.quantity,
       memberType: preRegForm.memberType,
-      source: 'pre-registered' as const,
+      source: 'pre-registered',
       paymentStatus: preRegForm.paymentStatus,
-      paymentReference: preRegForm.paymentRef,
-      status: paid ? 'confirmed' as const : 'pending' as const,
-      createdAt: now,
-      updatedAt: now,
-    }
-    const coupons = paid ? generateCouponsForRegistration(registration, now) : []
-    const nextState = {
-      ...state,
-      registrations: [registration, ...state.registrations],
-      coupons: [...coupons, ...state.coupons],
-    }
-    pushStateAndLog(
-      nextState,
-      'pre-registration.create',
-      paid ? `Pre-registration confirmed for ${registration.name}` : `Pre-registration pending for ${registration.name}`,
-      registration.eventId,
-    )
-    if (paid) {
-      sendRegistrationQrsWhatsApp(registration, coupons)
-    } else {
-      openWhatsApp(registration.whatsapp, 'Registration received, payment pending. Please complete payment for QR issue.')
-    }
+      paymentReference: preRegForm.paymentRef || undefined,
+    })
+    await refreshFromServer(authToken)
+    alert('Pre-registration saved. WhatsApp status message is sent by backend if configured.')
   }
 
-  const approvePending = (registrationId: string) => {
+  const approvePending = async (registrationId: string) => {
+    if (!authToken) return
     const registration = state.registrations.find((item) => item.id === registrationId)
     if (!registration || registration.status !== 'pending') return
-    const now = new Date().toISOString()
-    const coupons = generateCouponsForRegistration(registration, now)
-    const registrations = state.registrations.map((item) =>
-      item.id === registrationId
-        ? { ...item, status: 'confirmed' as const, paymentStatus: 'paid' as const, updatedAt: now }
-        : item,
-    )
-    const nextState = { ...state, registrations, coupons: [...coupons, ...state.coupons] }
-    pushStateAndLog(nextState, 'pre-registration.approve', `Approved ${registration.name} and issued QR`, registration.eventId)
-    sendRegistrationQrsWhatsApp(registration, coupons)
+    await approveRegistrationRequest(authToken, registrationId)
+    await refreshFromServer(authToken)
+    alert('Approved. QR message dispatched via backend WhatsApp API.')
   }
 
-  const rejectPreRegistration = (registrationId: string) => {
-    const registration = state.registrations.find((item) => item.id === registrationId)
-    if (!registration) return
-    const registrations = state.registrations.map((item) =>
-      item.id === registrationId ? { ...item, status: 'cancelled' as const, updatedAt: new Date().toISOString() } : item,
-    )
-    pushStateAndLog({ ...state, registrations }, 'pre-registration.reject', `Rejected ${registration.name}`, registration.eventId)
+  const rejectPreRegistration = async (registrationId: string) => {
+    if (!authToken) return
+    await rejectRegistrationRequest(authToken, registrationId)
+    await refreshFromServer(authToken)
   }
 
-  const addPayment = () => {
-    if (!paymentForm.name || !paymentForm.phone || paymentForm.amount <= 0 || !paymentForm.collectorName) return
-    const createdAt = new Date().toISOString()
-    const payment: Payment = {
-      id: uuid(),
-      receiptNumber: `RCPT-${dayjs(createdAt).format('YYYYMMDD')}-${String(state.payments.length + 1).padStart(4, '0')}`,
-      name: paymentForm.name,
-      phone: paymentForm.phone,
+  const addPayment = async () => {
+    if (!authToken || !paymentForm.name || !paymentForm.phone || paymentForm.amount <= 0 || !paymentForm.collectorName) return
+    const response = await createPaymentRequest(authToken, {
+      ...paymentForm,
       amount: paymentForm.amount,
-      memberType: paymentForm.memberType,
       memberId: paymentForm.memberId || undefined,
-      newMember: paymentForm.newMember,
-      mode: paymentForm.mode,
       transactionId: paymentForm.transactionId || undefined,
-      purpose: paymentForm.purpose,
-      trustAccount: paymentForm.trustAccount,
-      collectorName: paymentForm.collectorName,
-      createdAt,
-    }
-    const nextState = { ...state, payments: [payment, ...state.payments] }
-    pushStateAndLog(nextState, 'payment.create', `Created receipt ${payment.receiptNumber} for ${payment.name}`)
-    const receiptText = [
-      `Receipt: ${payment.receiptNumber}`,
-      `Date: ${dayjs(payment.createdAt).format('DD MMM YYYY HH:mm')}`,
-      `Purpose: ${payment.purpose}`,
-      `Amount: ${payment.amount}`,
-      `Mode: ${payment.mode}`,
-      `Trust: ${payment.trustAccount}`,
-      `Transaction ID: ${payment.transactionId ?? 'N/A'}`,
-    ].join('\n')
-    openWhatsApp(payment.phone, `Thank you. Payment received.\n${receiptText}`)
+    })
+    await refreshFromServer(authToken)
+    alert(`Payment saved (${response.receiptNumber}). Receipt message sent via backend WhatsApp API.`)
   }
 
   const parseUploadRows = async (file: File) => {
@@ -359,9 +316,8 @@ function App() {
 
   const bulkUploadBhog = async (file: File) => {
     const rows = await parseUploadRows(file)
-    const now = new Date().toISOString()
-    const newRegistrations: Registration[] = []
-    const newCoupons: Coupon[] = []
+    if (!authToken || !selectedEvent?.id) return
+    const uploadRows: Array<Record<string, unknown>> = []
     const errors: string[] = []
     for (const [index, row] of rows.entries()) {
       const name = String(row.Name ?? row.name ?? '').trim()
@@ -382,8 +338,7 @@ function App() {
         errors.push(`Row ${index + 2}: event not found`)
         continue
       }
-      const registration: Registration = {
-        id: uuid(),
+      uploadRows.push({
         eventId,
         name,
         whatsapp,
@@ -391,65 +346,49 @@ function App() {
         memberType: 'non-member',
         source: 'on-spot',
         paymentStatus: 'paid',
-        status: 'confirmed',
-        createdAt: now,
-        updatedAt: now,
-      }
-      newRegistrations.push(registration)
-      newCoupons.push(...generateCouponsForRegistration(registration, now))
+      })
     }
-    const nextState = {
-      ...state,
-      registrations: [...newRegistrations, ...state.registrations],
-      coupons: [...newCoupons, ...state.coupons],
-    }
-    pushStateAndLog(
-      nextState,
-      'bhog.bulk-upload',
-      `Bulk uploaded ${newRegistrations.length} registrations with ${newCoupons.length} QRs`,
-      selectedEvent?.id,
+    const result = await bulkCreateRegistrationsRequest(authToken, {
+      rows: uploadRows,
+      defaults: { eventId: selectedEvent.id, source: 'on-spot', paymentStatus: 'paid' },
+    })
+    await refreshFromServer(authToken)
+    const combinedErrors = [...errors, ...result.errors]
+    alert(
+      combinedErrors.length
+        ? `Uploaded ${result.successCount} rows with errors:\n${combinedErrors.slice(0, 8).join('\n')}`
+        : `Bulk upload successful (${result.successCount} rows).`,
     )
-    alert(errors.length ? `Upload done with errors:\n${errors.slice(0, 6).join('\n')}` : 'Bulk upload successful.')
   }
 
   const bulkUploadPreReg = async (file: File) => {
     const rows = await parseUploadRows(file)
-    const now = new Date().toISOString()
-    const newRegistrations: Registration[] = []
-    const newCoupons: Coupon[] = []
+    if (!authToken || !selectedEvent?.id) return
+    const uploadRows: Array<Record<string, unknown>> = []
     for (const row of rows) {
       const rawStatus = String(row['Payment Status'] ?? row.paymentStatus ?? 'Not Paid').trim().toLowerCase()
       const paymentStatus: PaymentStatus = rawStatus === 'paid' ? 'paid' : 'not-paid'
-      const registration: Registration = {
-        id: uuid(),
-        eventId: selectedEvent?.id ?? '',
-        name: String(row.Name ?? '').trim(),
-        whatsapp: String(row['WhatsApp Number'] ?? '').trim(),
-        quantity: Number(row.Quantity ?? 1),
+      const name = String(row.Name ?? '').trim()
+      const whatsapp = String(row['WhatsApp Number'] ?? '').trim()
+      const quantity = Number(row.Quantity ?? 1)
+      if (!name || !whatsapp || quantity < 1) continue
+      uploadRows.push({
+        eventId: selectedEvent.id,
+        name,
+        whatsapp,
+        quantity,
         memberType: 'non-member',
         source: 'pre-registered',
         paymentStatus,
         paymentReference: String(row['Payment Reference'] ?? '').trim() || undefined,
-        status: paymentStatus === 'paid' ? 'confirmed' : 'pending',
-        createdAt: now,
-        updatedAt: now,
-      }
-      if (!registration.name || !registration.whatsapp || !registration.eventId || registration.quantity < 1) continue
-      newRegistrations.push(registration)
-      if (registration.paymentStatus === 'paid') {
-        newCoupons.push(...generateCouponsForRegistration(registration, now))
-      }
+      })
     }
-    pushStateAndLog(
-      {
-        ...state,
-        registrations: [...newRegistrations, ...state.registrations],
-        coupons: [...newCoupons, ...state.coupons],
-      },
-      'pre-registration.bulk-upload',
-      `Imported ${newRegistrations.length} pre-registrations`,
-      selectedEvent?.id,
-    )
+    const result = await bulkCreateRegistrationsRequest(authToken, {
+      rows: uploadRows,
+      defaults: { eventId: selectedEvent.id, source: 'pre-registered' },
+    })
+    await refreshFromServer(authToken)
+    alert(result.errors.length ? `Uploaded ${result.successCount} rows. Some failed.` : `Bulk upload successful (${result.successCount} rows).`)
   }
 
   const downloadBhogReport = () => {
@@ -560,7 +499,16 @@ function App() {
           <article className="card">
             <h2>QR Scan & Validation</h2>
             <input placeholder="Paste / scan QR token" value={scanToken} onChange={(e) => setScanToken(e.target.value)} />
-            <button onClick={scanCoupon}>Validate & Consume</button>
+            <div className="row">
+              <button onClick={() => void scanCoupon()}>Validate & Consume</button>
+              {!cameraActive ? (
+                <button onClick={() => void startCameraScanner()}>Start Camera Scan</button>
+              ) : (
+                <button onClick={stopCameraScanner}>Stop Camera</button>
+              )}
+            </div>
+            <video ref={videoRef} autoPlay playsInline muted style={{ width: '100%', borderRadius: 8, display: cameraActive ? 'block' : 'none' }} />
+            {cameraError && <p>{cameraError}</p>}
             <p>Event: {selectedEvent?.name}</p>
             <p>Issued: {eventCoupons.length}</p>
             <p>Scanned: {scannedCount}</p>
