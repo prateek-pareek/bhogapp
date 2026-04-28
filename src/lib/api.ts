@@ -1,7 +1,7 @@
 import type { AppState } from './storage'
 import type { UserRole } from '../types'
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000'
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? (window.location.hostname === 'localhost' ? 'http://localhost:4000' : `http://${window.location.hostname}:4000`)
 
 interface LoginResponse {
   token: string
@@ -83,6 +83,7 @@ export async function createRegistrationRequest(
     source: 'on-spot' | 'pre-registered'
     paymentStatus: 'paid' | 'not-paid'
     paymentReference?: string
+    status?: 'pending' | 'confirmed'
   },
 ): Promise<{ qrTokens: string[] }> {
   const res = await fetch(`${API_BASE}/api/registrations`, {
@@ -165,4 +166,14 @@ export async function bulkCreateRegistrationsRequest(
   if (!res.ok) throw new Error('Failed bulk upload')
   const json = await res.json() as { successCount: number; errors: string[] }
   return { successCount: json.successCount ?? 0, errors: json.errors ?? [] }
+}
+
+export async function fetchPublicTicketData(registrationId: string): Promise<{
+  registration: { id: string; name: string; quantity: number; status: string }
+  event: { name: string; date: string } | null
+  coupons: Array<{ token: string }>
+}> {
+  const res = await fetch(`${API_BASE}/api/public/ticket/${registrationId}`)
+  if (!res.ok) throw new Error('Ticket not found')
+  return res.json()
 }
