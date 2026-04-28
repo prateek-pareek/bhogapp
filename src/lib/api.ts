@@ -1,7 +1,11 @@
 import type { AppState } from './storage'
 import type { UserRole } from '../types'
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? (window.location.hostname === 'localhost' ? 'http://localhost:4000' : `http://${window.location.hostname}:4000`)
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? (
+  window.location.hostname === 'localhost' 
+    ? 'http://localhost:4000' 
+    : `${window.location.protocol}//${window.location.host}`
+)
 
 interface LoginResponse {
   token: string
