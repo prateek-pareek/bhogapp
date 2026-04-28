@@ -20,6 +20,10 @@ const {
   WHATSAPP_PHONE_NUMBER_ID = '',
   WHATSAPP_API_VERSION = 'v20.0',
   WHATSAPP_DEFAULT_COUNTRY_CODE = '91',
+  FRONTEND_URL = 'http://localhost:5173',
+  BREVO_API_KEY = '',
+  BREVO_SENDER_EMAIL = '',
+  BREVO_SENDER_NAME = 'Bhog Trust',
 } = process.env
 
 const userSchema = new mongoose.Schema(
@@ -82,7 +86,7 @@ const paymentSchema = new mongoose.Schema(
     paymentId: { type: String, required: true, unique: true, index: true },
     receiptNumber: { type: String, required: true, index: true },
     name: { type: String, required: true },
-    phone: { type: String, required: true },
+    email: { type: String },
     amount: { type: Number, required: true },
     memberType: { type: String, enum: ['member', 'non-member'], required: true },
     memberId: { type: String },
@@ -248,7 +252,7 @@ async function buildStateFromCollections() {
       id: p.paymentId,
       receiptNumber: p.receiptNumber,
       name: p.name,
-      phone: p.phone,
+      email: p.email,
       amount: p.amount,
       memberType: p.memberType,
       memberId: p.memberId,
@@ -375,9 +379,16 @@ function normalizePhone(rawPhone) {
 }
 
 async function sendWhatsAppText(toPhone, message) {
-  if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) return { sent: false, skipped: true }
+  if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
+    console.log('ℹ️ WhatsApp skipped: Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID')
+    return { sent: false, skipped: true }
+  }
   const to = normalizePhone(toPhone)
-  if (!to) return { sent: false, skipped: true }
+  if (!to) {
+    console.log(`ℹ️ WhatsApp skipped: Invalid phone number "${toPhone}"`)
+    return { sent: false, skipped: true }
+  }
+  console.log(`🚀 Sending WhatsApp to ${to}...`)
   const response = await fetch(
     `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
     {
@@ -396,8 +407,58 @@ async function sendWhatsAppText(toPhone, message) {
   )
   if (!response.ok) {
     const errorBody = await response.text()
+    console.error('❌ WhatsApp API Error:', errorBody)
     throw new Error(`WhatsApp API failed: ${errorBody}`)
   }
+  return { sent: true }
+}
+
+async function sendReceiptEmail(toEmail, { receiptNumber, name, amount, purpose, mode, trustAccount, transactionId, date }) {
+  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) {
+    console.log('ℹ️ Email skipped: BREVO_API_KEY or BREVO_SENDER_EMAIL not set in .env')
+    return { sent: false, skipped: true }
+  }
+  const html = `
+    <div style="font-family:sans-serif;max-width:500px;margin:auto;border:1px solid #e0c88a;border-radius:12px;overflow:hidden;">
+      <div style="background:#800000;color:#F97316;padding:24px;text-align:center;">
+        <h2 style="margin:0;font-size:22px;">🙏 Official Payment Receipt</h2>
+        <p style="margin:4px 0 0;color:#fff;font-size:13px;">Jai Shree Krishna</p>
+      </div>
+      <div style="padding:24px;background:#fffaf0;">
+        <table style="width:100%;border-collapse:collapse;font-size:15px;">
+          <tr><td style="padding:8px 0;color:#555;width:45%">Receipt No</td><td><strong>${receiptNumber}</strong></td></tr>
+          <tr><td style="padding:8px 0;color:#555">Date</td><td>${date}</td></tr>
+          <tr><td style="padding:8px 0;color:#555">Name</td><td>${name}</td></tr>
+          <tr><td style="padding:8px 0;color:#555">Amount</td><td><strong style="color:#800000">₹${amount}</strong></td></tr>
+          <tr><td style="padding:8px 0;color:#555">Purpose</td><td>${purpose.toUpperCase()}</td></tr>
+          <tr><td style="padding:8px 0;color:#555">Mode</td><td>${mode.toUpperCase()}</td></tr>
+          <tr><td style="padding:8px 0;color:#555">Trust Account</td><td>${trustAccount}</td></tr>
+          <tr><td style="padding:8px 0;color:#555">Transaction ID</td><td>${transactionId || 'N/A'}</td></tr>
+        </table>
+      </div>
+      <div style="background:#800000;color:#fff;padding:16px;text-align:center;font-size:13px;">
+        Thank you for your generous contribution 🙏
+      </div>
+    </div>
+  `
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': BREVO_API_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sender: { name: BREVO_SENDER_NAME, email: BREVO_SENDER_EMAIL },
+      to: [{ email: toEmail }],
+      subject: `Payment Receipt ${receiptNumber} – Bhog Trust`,
+      htmlContent: html,
+    }),
+  })
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`Brevo API error: ${err}`)
+  }
+  console.log(`✅ Receipt email sent to ${toEmail} via Brevo API`)
   return { sent: true }
 }
 
@@ -505,15 +566,20 @@ app.post('/api/registrations', requireAuth, requireRoles('admin'), async (req, r
     eventId,
   )
   if (paymentStatus === 'paid') {
+    const ticketLines = coupons.map((c, i) => `Ticket ${i + 1}: ${FRONTEND_URL}/ticket/${registrationId}?t=${c.qrToken}`)
     const message = [
-      `Jai Shree Krishna ${name},`,
-      `Your Bhog QR(s) for event ${eventId}:`,
-      ...coupons.map((c, i) => `${i + 1}. ${c.qrToken}`),
-      'Each QR can be scanned once.',
+      `🎟️ *Digital Entry Pass - Jai Shree Krishna!*`,
+      `----------------------------`,
+      `Dear *${name}*,`,
+      `Your Bhog passes are ready. Each link below is for one person:`,
+      ``,
+      ...ticketLines,
+      ``,
+      `_Please show the QR code at the entry counter._`,
     ].join('\n')
     sendWhatsAppText(whatsapp, message).catch(() => undefined)
   } else {
-    sendWhatsAppText(whatsapp, 'Registration received, payment pending. Please complete payment for QR issue.').catch(() => undefined)
+    sendWhatsAppText(whatsapp, `🙏 *Jai Shree Krishna ${name}*, your registration is received. Please complete the payment to receive your digital entry passes.`).catch(() => undefined)
   }
   return res.status(201).json({
     registrationId,
@@ -605,11 +671,16 @@ app.post('/api/registrations/:registrationId/approve', requireAuth, requireRoles
     `Approved ${registration.name} and issued ${coupons.length} QRs`,
     registration.eventId,
   )
+  const ticketLines = coupons.map((c, i) => `Ticket ${i + 1}: ${FRONTEND_URL}/ticket/${registration.registrationId}?t=${c.qrToken}`)
   const message = [
-    `Jai Shree Krishna ${registration.name},`,
-    'Your payment is confirmed. QR(s):',
-    ...coupons.map((c, i) => `${i + 1}. ${c.qrToken}`),
-    'Each QR can be scanned once.',
+    `🎟️ *Digital Entry Pass - Jai Shree Krishna!*`,
+    `----------------------------`,
+    `Dear *${registration.name}*,`,
+    `Your payment has been verified! Your Bhog passes are ready:`,
+    ``,
+    ...ticketLines,
+    ``,
+    `_Please show the QR code at the entry counter._`,
   ].join('\n')
   sendWhatsAppText(registration.whatsapp, message).catch(() => undefined)
   return res.json({ ok: true, qrTokens: coupons.map((c) => c.qrToken) })
@@ -646,7 +717,7 @@ app.post('/api/coupons/scan', requireAuth, requireRoles('admin', 'reception', 's
 app.post('/api/payments', requireAuth, requireRoles('admin', 'collector'), async (req, res) => {
   const {
     name,
-    phone,
+    email,
     amount,
     memberType,
     memberId,
@@ -657,7 +728,7 @@ app.post('/api/payments', requireAuth, requireRoles('admin', 'collector'), async
     trustAccount,
     collectorName,
   } = req.body ?? {}
-  if (!name || !phone || !amount || !mode || !purpose || !trustAccount || !collectorName) {
+  if (!name || !amount || !mode || !purpose || !trustAccount || !collectorName) {
     return res.status(400).json({ message: 'Missing required fields' })
   }
   const now = new Date().toISOString()
@@ -669,7 +740,7 @@ app.post('/api/payments', requireAuth, requireRoles('admin', 'collector'), async
     paymentId,
     receiptNumber,
     name,
-    phone,
+    email,
     amount,
     memberType,
     memberId,
@@ -682,16 +753,11 @@ app.post('/api/payments', requireAuth, requireRoles('admin', 'collector'), async
     createdAtRaw: now,
   })
   await writeAudit(req, 'payment.create', `Created payment ${receiptNumber} (${amount})`)
-  const receiptText = [
-    `Receipt: ${receiptNumber}`,
-    `Date: ${now}`,
-    `Purpose: ${purpose}`,
-    `Amount: ${amount}`,
-    `Mode: ${mode}`,
-    `Trust: ${trustAccount}`,
-    `Transaction ID: ${transactionId || 'N/A'}`,
-  ].join('\n')
-  sendWhatsAppText(phone, `Thank you. Payment received.\n${receiptText}`).catch(() => undefined)
+  if (email) {
+    sendReceiptEmail(email, {
+      receiptNumber, name, amount, purpose, mode, trustAccount, transactionId, date: now.slice(0, 10),
+    }).catch((err) => console.error('❌ Email Error:', err.message))
+  }
   return res.status(201).json({ paymentId, receiptNumber, createdAt: now })
 })
 
@@ -756,12 +822,36 @@ app.get('/api/audit-logs', requireAuth, async (req, res) => {
       id: a.logId,
       action: a.action,
       actor: a.actor,
-      role: a.role,
+            role: a.role,
       eventId: a.eventId,
       details: a.details,
       createdAt: a.createdAtRaw,
     })),
   })
+})
+
+app.get('/api/public/ticket/:registrationId', async (req, res) => {
+  try {
+    const { registrationId } = req.params
+    const registration = await Registration.findOne({ registrationId })
+    if (!registration) return res.status(404).json({ message: 'Registration not found' })
+    
+    const coupons = await Coupon.find({ registrationId: registration.registrationId })
+    const event = await Event.findOne({ eventId: registration.eventId })
+    
+    return res.json({
+      registration: {
+        id: registration.registrationId,
+        name: registration.name,
+        quantity: registration.quantity,
+        status: registration.status,
+      },
+      event: event ? { name: event.name, date: event.date } : null,
+      coupons: coupons.map(c => ({ token: c.qrToken })),
+    })
+  } catch (error) {
+    return res.status(500).json({ message: 'Internal server error' })
+  }
 })
 
 app.post('/api/audit-logs', requireAuth, async (req, res) => {
