@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  api:
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER}/bhogapp-api:latest
+    container_name: bhogapp-api
+    restart: always
+    expose:
+      - "5010"
+    # The environment variables will be injected by your CI/CD pipeline
+    env_file:
+      - .env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.bhogapp-api.rule=Host(`bhogapp.prateekpareek.com`)" # Replace with your API domain
+      - "traefik.http.routers.bhogapp-api.entrypoints=websecure"
+      - "traefik.http.routers.bhogapp-api.tls.certresolver=letsencrypt" # Replace with your cert resolver name
+      - "traefik.http.services.bhogapp-api.loadbalancer.server.port=5010"
