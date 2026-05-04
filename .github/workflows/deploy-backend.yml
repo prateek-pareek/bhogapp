@@ -52,6 +52,7 @@ jobs:
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
+    environment: VPS
     
     steps:
       - name: Checkout repository
